@@ -11,6 +11,7 @@ import {
   Loader2
 } from 'lucide-react';
 import type { TranslationJob } from '../types';
+import { generateSrtContent, generateVttContent, triggerDownload } from '../utils/subtitleFormatters';
 
 interface DownloadOptionsProps {
   job: TranslationJob;
@@ -26,7 +27,7 @@ export const DownloadOptions: React.FC<DownloadOptionsProps> = ({ job, onClose }
   const [burnError, setBurnError] = useState<string | null>(null);
   const [copiedType, setCopiedType] = useState<'srt' | 'vtt' | null>(null);
 
-  // Trigger FFmpeg subtitle burning
+  // Trigger FFmpeg subtitle burning on server
   const handleBurnSubtitles = async () => {
     setIsBurning(true);
     setBurnError(null);
@@ -38,7 +39,7 @@ export const DownloadOptions: React.FC<DownloadOptionsProps> = ({ job, onClose }
 
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || 'Failed to render subtitles into video');
+        throw new Error(data.error || 'Failed to render subtitles into video on server.');
       }
 
       const data = await res.json();
@@ -46,17 +47,31 @@ export const DownloadOptions: React.FC<DownloadOptionsProps> = ({ job, onClose }
       setBurnedDownloadUrl(data.downloadUrl || `/api/jobs/${job.id}/download/video`);
     } catch (err: any) {
       console.error('Burn error:', err);
-      setBurnError(err.message || 'Subtitles burning failed.');
+      setBurnError(
+        err.message || 'Hardcoded video rendering requires server-side FFmpeg. You can download the universal .SRT or .VTT subtitles above to play with any video player.'
+      );
     } finally {
       setIsBurning(false);
     }
   };
 
+  const handleDownloadSrt = () => {
+    const srtText = generateSrtContent(job.subtitles || []);
+    const baseName = job.fileName.replace(/\.[^/.]+$/, '');
+    triggerDownload(srtText, `${baseName}_english_subtitles.srt`, 'text/plain');
+  };
+
+  const handleDownloadVtt = () => {
+    const vttText = generateVttContent(job.subtitles || []);
+    const baseName = job.fileName.replace(/\.[^/.]+$/, '');
+    triggerDownload(vttText, `${baseName}_english_subtitles.vtt`, 'text/vtt');
+  };
+
   const handleCopyClipboard = async (type: 'srt' | 'vtt') => {
     try {
-      const url = `/api/jobs/${job.id}/download/${type}`;
-      const res = await fetch(url);
-      const text = await res.text();
+      const text = type === 'srt' 
+        ? generateSrtContent(job.subtitles || [])
+        : generateVttContent(job.subtitles || []);
       await navigator.clipboard.writeText(text);
       setCopiedType(type);
       setTimeout(() => setCopiedType(null), 2500);
@@ -77,14 +92,14 @@ export const DownloadOptions: React.FC<DownloadOptionsProps> = ({ job, onClose }
             <div>
               <h2 className="text-xl font-bold font-display text-white">Download Translation</h2>
               <p className="text-xs text-slate-400">
-                Choose your desired export format: subtitle files or subtitled video.
+                Export synchronized English subtitles or download permanently subtitled video.
               </p>
             </div>
           </div>
 
           <button
             onClick={onClose}
-            className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors"
+            className="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
@@ -106,7 +121,7 @@ export const DownloadOptions: React.FC<DownloadOptionsProps> = ({ job, onClose }
                   </span>
                 </div>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Universal standard for VLC, YouTube, Netflix, Premiere Pro, and media players.
+                  Universal standard for VLC, YouTube, Netflix, MX Player, and Premiere Pro.
                 </p>
               </div>
             </div>
@@ -121,14 +136,13 @@ export const DownloadOptions: React.FC<DownloadOptionsProps> = ({ job, onClose }
                 {copiedType === 'srt' ? 'Copied' : 'Copy'}
               </button>
 
-              <a
-                href={`/api/jobs/${job.id}/download/srt`}
-                download
-                className="px-4 py-2 text-xs font-semibold text-white bg-purple-600 hover:bg-purple-500 rounded-lg shadow-md transition-colors flex items-center gap-1.5"
+              <button
+                onClick={handleDownloadSrt}
+                className="px-4 py-2 text-xs font-semibold text-white bg-purple-600 hover:bg-purple-500 rounded-lg shadow-md transition-colors flex items-center gap-1.5 cursor-pointer"
               >
                 <Download className="w-3.5 h-3.5" />
                 Download .SRT
-              </a>
+              </button>
             </div>
           </div>
 
@@ -146,7 +160,7 @@ export const DownloadOptions: React.FC<DownloadOptionsProps> = ({ job, onClose }
                   </span>
                 </div>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Optimized for web video elements, HTML5 video players, and streaming platforms.
+                  Optimized for HTML5 web video players, streaming servers, and browsers.
                 </p>
               </div>
             </div>
@@ -161,14 +175,13 @@ export const DownloadOptions: React.FC<DownloadOptionsProps> = ({ job, onClose }
                 {copiedType === 'vtt' ? 'Copied' : 'Copy'}
               </button>
 
-              <a
-                href={`/api/jobs/${job.id}/download/vtt`}
-                download
-                className="px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg shadow-md transition-colors flex items-center gap-1.5"
+              <button
+                onClick={handleDownloadVtt}
+                className="px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg shadow-md transition-colors flex items-center gap-1.5 cursor-pointer"
               >
                 <Download className="w-3.5 h-3.5" />
                 Download .VTT
-              </a>
+              </button>
             </div>
           </div>
 
@@ -187,7 +200,7 @@ export const DownloadOptions: React.FC<DownloadOptionsProps> = ({ job, onClose }
                     </span>
                   </div>
                   <p className="text-xs text-slate-400 mt-0.5">
-                    FFmpeg embeds English subtitles directly into the video frames. Ready for WhatsApp, Instagram, or any TV player without needing external subtitle files.
+                    Embeds English subtitles directly into the video frames. Ready for WhatsApp, Instagram, or TVs without requiring external subtitle files.
                   </p>
                 </div>
               </div>
@@ -195,15 +208,15 @@ export const DownloadOptions: React.FC<DownloadOptionsProps> = ({ job, onClose }
 
             {/* Burn Progress / Action */}
             {burnError && (
-              <div className="p-3 rounded-lg bg-red-950/60 border border-red-500/40 text-red-200 text-xs flex items-center gap-2">
-                <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+              <div className="p-3 rounded-lg bg-amber-950/60 border border-amber-500/40 text-amber-200 text-xs flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
                 <span>{burnError}</span>
               </div>
             )}
 
             <div className="pt-2 flex flex-wrap items-center justify-between gap-3 border-t border-purple-900/30">
               <span className="text-xs text-slate-400">
-                {burnCompleted ? 'Subtitles successfully burned into MP4!' : 'Requires 5-15 seconds for FFmpeg video frame re-encoding.'}
+                {burnCompleted ? 'Subtitles successfully burned into MP4!' : 'Requires server-side FFmpeg rendering.'}
               </span>
 
               {burnCompleted && burnedDownloadUrl ? (
@@ -224,7 +237,7 @@ export const DownloadOptions: React.FC<DownloadOptionsProps> = ({ job, onClose }
                   {isBurning ? (
                     <>
                       <Loader2 className="w-4 h-4 animate-spin" />
-                      Burning Subtitles via FFmpeg...
+                      Rendering Video with FFmpeg...
                     </>
                   ) : (
                     <>

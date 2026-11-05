@@ -14,13 +14,13 @@ import {
   Sparkles, 
   Download, 
   Edit3, 
-  Upload, 
   RotateCw, 
   CheckCircle2, 
   FileVideo,
-  Layers
+  XCircle
 } from 'lucide-react';
 import type { TranslationJob, SubtitleStyle, SubtitleCue } from './types';
+import { createLocalJob, runBrowserTranslation } from './services/translationService';
 
 export default function App() {
   const [activeJob, setActiveJob] = useState<TranslationJob | null>(null);
@@ -28,6 +28,9 @@ export default function App() {
   const [isDownloadOpen, setIsDownloadOpen] = useState(false);
   const [isSamplesModalOpen, setIsSamplesModalOpen] = useState(false);
   const [showLandingUnderneath, setShowLandingUnderneath] = useState(false);
+
+  const activeFileRef = useRef<File | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Subtitle styling options
   const [styleConfig, setStyleConfig] = useState<SubtitleStyle>({
@@ -38,33 +41,54 @@ export default function App() {
     syncOffset: 0
   });
 
-  // Polling active job status & progressive subtitles
-  useEffect(() => {
-    if (!activeJob) return;
+  // Handle instant start translation from uploader
+  const handleStartTranslation = async (file: File, durationSec: number | null) => {
+    activeFileRef.current = file;
+    setShowLandingUnderneath(false);
 
-    const isRunning = ['uploading', 'extracting_audio', 'detecting_speech', 'translating', 'synchronizing'].includes(
-      activeJob.status
-    );
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
 
-    if (!isRunning) return;
+    const initialJob = createLocalJob(file, durationSec || 0);
+    setActiveJob(initialJob);
 
-    const interval = setInterval(async () => {
-      try {
-        const res = await fetch(`/api/jobs/${activeJob.id}`);
-        if (!res.ok) return;
-        const data = await res.json();
-        if (data.job) {
-          setActiveJob(data.job);
-        }
-      } catch (err) {
-        console.error('Job polling error:', err);
+    try {
+      await runBrowserTranslation(
+        file,
+        initialJob,
+        (updates) => {
+          setActiveJob((prev) => (prev ? { ...prev, ...updates } : null));
+        },
+        abortController.signal
+      );
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        console.log('Translation aborted by user');
+      } else {
+        console.error('Translation pipeline error:', err);
+        setActiveJob((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: 'error',
+                error: err.message || 'Translation failed. Please check Gemini API key.',
+                currentStepText: `Error: ${err.message || 'Translation failed'}`
+              }
+            : null
+        );
       }
-    }, 1000);
+    } finally {
+      abortControllerRef.current = null;
+    }
+  };
 
-    return () => clearInterval(interval);
-  }, [activeJob?.id, activeJob?.status]);
-
-  const handleJobCreated = (job: TranslationJob) => {
+  const handleJobCreated = (job: TranslationJob, file?: File) => {
+    if (file) {
+      activeFileRef.current = file;
+    }
     setActiveJob(job);
     setShowLandingUnderneath(false);
   };
@@ -75,23 +99,49 @@ export default function App() {
         ...activeJob,
         subtitles: newSubtitles
       });
+      // Sync with server in background
+      fetch(`/api/jobs/${activeJob.id}/subtitles`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subtitles: newSubtitles })
+      }).catch(() => {});
     }
   };
 
-  const handleRetryJob = async () => {
-    if (!activeJob) return;
-    try {
-      const res = await fetch(`/api/jobs/${activeJob.id}/start`, { method: 'POST' });
-      if (res.ok) {
-        const data = await res.json();
-        setActiveJob(data.job);
-      }
-    } catch (err) {
-      console.error('Retry failed:', err);
+  const handleCancelActiveJob = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    if (activeJob) {
+      setActiveJob({
+        ...activeJob,
+        status: 'error',
+        error: 'Translation paused by user',
+        currentStepText: 'Translation paused. Click Retry to continue.'
+      });
+    }
+  };
+
+  const handleRetryJob = () => {
+    if (activeFileRef.current && activeJob) {
+      handleStartTranslation(activeFileRef.current, activeJob.duration);
+    } else if (activeJob) {
+      fetch(`/api/jobs/${activeJob.id}/start`, { method: 'POST' })
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.job) setActiveJob(data.job);
+        })
+        .catch(console.error);
     }
   };
 
   const handleResetToNewUpload = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    activeFileRef.current = null;
     setActiveJob(null);
     setShowLandingUnderneath(false);
   };
@@ -160,6 +210,13 @@ export default function App() {
                   <span className="font-mono text-purple-400 font-bold ml-1">
                     {activeJob.progress}%
                   </span>
+                  <button
+                    onClick={handleCancelActiveJob}
+                    className="ml-1.5 text-red-400 hover:text-red-300 p-0.5 rounded cursor-pointer"
+                    title="Stop translation"
+                  >
+                    <XCircle className="w-3.5 h-3.5" />
+                  </button>
                 </div>
               ) : activeJob.status === 'completed' ? (
                 <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-950/60 border border-emerald-500/30 text-emerald-300 text-[11px] font-medium">
@@ -169,7 +226,7 @@ export default function App() {
               ) : activeJob.status === 'error' ? (
                 <button
                   onClick={handleRetryJob}
-                  className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-red-950/80 border border-red-500/40 text-red-200 text-[11px] font-medium hover:bg-red-900/80"
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-red-950/80 border border-red-500/40 text-red-200 text-[11px] font-medium hover:bg-red-900/80 cursor-pointer"
                 >
                   <RotateCw className="w-3 h-3" />
                   <span>Retry Translation</span>
@@ -197,7 +254,7 @@ export default function App() {
 
               <button
                 onClick={() => setShowLandingUnderneath(true)}
-                className="px-2 py-1 text-xs text-slate-400 hover:text-slate-200 hidden xl:block"
+                className="px-2 py-1 text-xs text-slate-400 hover:text-slate-200 hidden xl:block cursor-pointer"
                 title="View How It Works & Features"
               >
                 Info
@@ -234,7 +291,7 @@ export default function App() {
               </span>
               <button
                 onClick={() => setShowLandingUnderneath(false)}
-                className="px-3 py-1 bg-purple-600 hover:bg-purple-500 text-white font-semibold rounded-md shadow-sm transition-all"
+                className="px-3 py-1 bg-purple-600 hover:bg-purple-500 text-white font-semibold rounded-md shadow-sm transition-all cursor-pointer"
               >
                 Return to Fit-To-Screen Studio →
               </button>
@@ -252,6 +309,7 @@ export default function App() {
             <VideoUploader
               onJobCreated={handleJobCreated}
               onOpenSamples={() => setIsSamplesModalOpen(true)}
+              onStartTranslation={handleStartTranslation}
             />
           </div>
 

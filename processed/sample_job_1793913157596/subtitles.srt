@@ -1,0 +1,23 @@
+1
+00:00:01,000 --> 00:00:04,200
+[Inspector Kabir]: Tell me the truth, what were you doing at the warehouse that night?
+
+2
+00:00:04,800 --> 00:00:08,500
+[Rajesh]: Sir, I swear I only stopped there for some tea. I have nothing to do with any of this!
+
+3
+00:00:09,100 --> 00:00:13,400
+[Inspector Kabir]: Don't lie to me! The CCTV footage clearly shows that bag in your hand.
+
+4
+00:00:14,000 --> 00:00:18,200
+[Rajesh]: That bag... an unknown guy gave it to me just to drop off at the station.
+
+5
+00:00:18,800 --> 00:00:23,500
+[Inspector Kabir]: If you don't spill the truth right now, you will rot behind bars for the rest of your life.
+
+6
+00:00:24,200 --> 00:00:29,800
+[Rajesh]: Alright sir, I will tell you everything... but first, promise me my family will be safe.

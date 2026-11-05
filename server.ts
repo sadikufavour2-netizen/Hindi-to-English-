@@ -3,14 +3,12 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { fileURLToPath } from 'url';
-import { exec, spawn } from 'child_process';
+import { exec } from 'child_process';
 import { promisify } from 'util';
 import multer from 'multer';
 import dotenv from 'dotenv';
-import ffmpegStatic from 'ffmpeg-static';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
-import type { SubtitleCue, TranslationJob, JobStatus } from './src/types';
+import type { SubtitleCue, TranslationJob } from './src/types';
 
 dotenv.config();
 
@@ -45,10 +43,10 @@ for (const dir of [UPLOADS_DIR, PROCESSED_DIR, CHUNKS_DIR, SAMPLES_DIR]) {
   }
 }
 
-// FFmpeg binary resolution: use ffmpeg-static if present, else fallback to system ffmpeg
-const FFMPEG_BIN = (ffmpegStatic && fs.existsSync(ffmpegStatic)) ? `"${ffmpegStatic}"` : 'ffmpeg';
+// FFmpeg binary resolution: use system ffmpeg if available
+const FFMPEG_BIN = 'ffmpeg';
 
-// Multer storage
+// Multer storage for direct video upload
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
     cb(null, UPLOADS_DIR);
@@ -64,21 +62,14 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: { fileSize: 2048 * 1024 * 1024 }, // 2GB
-  fileFilter: (_req, file, cb) => {
-    // Accept all standard video extensions and video mime types
-    const ext = path.extname(file.originalname).toLowerCase();
-    const validExts = ['.mp4', '.mov', '.mkv', '.webm', '.m4v', '.avi', '.wmv', '.flv', '.3gp', '.ts', '.mpeg', '.mpg'];
-    if (validExts.includes(ext) || file.mimetype.startsWith('video/') || file.mimetype === 'application/octet-stream') {
-      cb(null, true);
-    } else {
-      cb(null, true); // Fallback: let FFmpeg handle format detection
-    }
+  fileFilter: (_req, _file, cb) => {
+    cb(null, true);
   }
 });
 
-// Chunk upload multer with 35MB limit per chunk
+// Chunk upload multer with 15MB limit per chunk
 const chunkStorage = multer.memoryStorage();
-const chunkUpload = multer({ storage: chunkStorage, limits: { fileSize: 35 * 1024 * 1024 } });
+const chunkUpload = multer({ storage: chunkStorage, limits: { fileSize: 15 * 1024 * 1024 } });
 
 // In-Memory Jobs Store
 const jobs = new Map<string, TranslationJob>();
@@ -88,7 +79,7 @@ let aiClient: GoogleGenAI | null = null;
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error('GEMINI_API_KEY environment variable is not set. Please configure it in Settings > Secrets.');
+    throw new Error('GEMINI_API_KEY environment variable is not configured. Please add GEMINI_API_KEY in your hosting dashboard or .env file.');
   }
   if (!aiClient) {
     aiClient = new GoogleGenAI({
@@ -106,24 +97,30 @@ function getGeminiClient(): GoogleGenAI {
 // Utilities for time formatting
 export function formatSrtTime(seconds: number): string {
   const pad = (num: number, size = 2) => String(Math.floor(num)).padStart(size, '0');
-  const hrs = pad(seconds / 3600);
-  const mins = pad((seconds % 3600) / 60);
-  const secs = pad(seconds % 60);
-  const millis = pad(Math.round((seconds % 1) * 1000), 3);
+  const safeSec = Math.max(0, isNaN(seconds) ? 0 : seconds);
+  const hrs = pad(safeSec / 3600);
+  const mins = pad((safeSec % 3600) / 60);
+  const secs = pad(safeSec % 60);
+  const millis = pad(Math.round((safeSec % 1) * 1000), 3);
   return `${hrs}:${mins}:${secs},${millis}`;
 }
 
 export function formatVttTime(seconds: number): string {
   const pad = (num: number, size = 2) => String(Math.floor(num)).padStart(size, '0');
-  const hrs = pad(seconds / 3600);
-  const mins = pad((seconds % 3600) / 60);
-  const secs = pad(seconds % 60);
-  const millis = pad(Math.round((seconds % 1) * 1000), 3);
+  const safeSec = Math.max(0, isNaN(seconds) ? 0 : seconds);
+  const hrs = pad(safeSec / 3600);
+  const mins = pad((safeSec % 3600) / 60);
+  const secs = pad(safeSec % 60);
+  const millis = pad(Math.round((safeSec % 1) * 1000), 3);
   return `${hrs}:${mins}:${secs}.${millis}`;
 }
 
 export function generateSrtContent(subtitles: SubtitleCue[]): string {
+  if (!subtitles || subtitles.length === 0) {
+    return '1\n00:00:00,000 --> 00:00:02,000\n[SUBLYAI]: No dialogue detected\n';
+  }
   return subtitles
+    .slice()
     .sort((a, b) => a.startTime - b.startTime)
     .map((cue, index) => {
       const speakerPrefix = cue.speaker ? `[${cue.speaker}]: ` : '';
@@ -133,7 +130,11 @@ export function generateSrtContent(subtitles: SubtitleCue[]): string {
 }
 
 export function generateVttContent(subtitles: SubtitleCue[]): string {
+  if (!subtitles || subtitles.length === 0) {
+    return 'WEBVTT - SUBLYAI Hindi to English Subtitles\n\n1\n00:00:00.000 --> 00:00:02.000\n[SUBLYAI]: No dialogue detected\n';
+  }
   const cues = subtitles
+    .slice()
     .sort((a, b) => a.startTime - b.startTime)
     .map((cue, index) => {
       const speakerPrefix = cue.speaker ? `<v ${cue.speaker}>` : '';
@@ -144,7 +145,7 @@ export function generateVttContent(subtitles: SubtitleCue[]): string {
   return `WEBVTT - SUBLYAI Hindi to English Subtitles\n\n${cues}`;
 }
 
-// Helper to persist jobs in memory and on disk for serverless compatibility
+// Helper to persist jobs in memory and on disk for serverless persistence
 function getJob(id: string): TranslationJob | null {
   if (jobs.has(id)) return jobs.get(id)!;
   try {
@@ -179,7 +180,6 @@ async function getVideoDuration(filePath: string): Promise<number> {
     if (!isNaN(dur) && dur > 0) return dur;
   } catch {}
 
-  // Fallback: parse Duration: HH:MM:SS from ffmpeg banner
   try {
     const { stderr } = await execAsync(`${FFMPEG_BIN} -i "${filePath}" 2>&1 || true`);
     const match = stderr.match(/Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})/);
@@ -194,7 +194,7 @@ async function getVideoDuration(filePath: string): Promise<number> {
   return 0;
 }
 
-// Extract audio using FFmpeg with multithreading and ultrafast speed
+// Extract audio using FFmpeg with multithreading
 async function extractAudio(videoPath: string, outputAudioPath: string): Promise<void> {
   const cmd = `${FFMPEG_BIN} -y -threads 0 -i "${videoPath}" -vn -acodec libmp3lame -ar 16000 -ac 1 -b:a 48k "${outputAudioPath}"`;
   await execAsync(cmd);
@@ -214,9 +214,29 @@ async function segmentAudio(audioPath: string, jobDir: string, segmentSeconds = 
   return files;
 }
 
-// Background Translation Pipeline
+// Translation prompt builder
+function buildTranslationPrompt(segmentDuration = 60): string {
+  return `You are a world-class professional Hindi-to-English cinema & video translator and subtitler.
+Your task is to transcribe Hindi or Hinglish spoken dialogue in this audio clip, and translate it into clear, natural, modern English subtitles.
+
+CRITICAL TRANSLATION REQUIREMENTS:
+1. Detect any Hindi, Urdu, or Hinglish speech in this audio track.
+2. Transcribe the spoken Hindi dialogue accurately.
+3. Translate into natural, high-quality, conversational English:
+   - Understand Indian expressions, cultural idioms, humor, and emotional nuances (e.g., "Arre yaar", "Bhai", "Chalo", "Jugaad", "Kya baat hai", "Shaabash").
+   - Maintain the correct emotional tone, sarcasm, urgency, romance, or affection.
+   - Do NOT translate literally word-by-word if it sounds unnatural in English; provide cinematic, engaging subtitles.
+4. Distinguish different speakers where multiple people talk (e.g. "Speaker 1", "Speaker 2", or character names if mentioned).
+5. Accurate Timestamps:
+   - Provide "startSeconds" and "endSeconds" relative to THIS segment (from 0.0 to ${segmentDuration}.0 seconds).
+   - Sync the subtitle start and end precisely with when dialogue begins and finishes.
+6. Ignore background music, sound effects, ambient noise, and silence. Do NOT invent dialogue.
+7. If there is no dialogue in this audio, set hasSpeech to false and return an empty subtitles array.`;
+}
+
+// Server-side translation runner for uploaded video files
 async function runTranslationJob(jobId: string) {
-  const job = jobs.get(jobId);
+  const job = getJob(jobId);
   if (!job) return;
 
   try {
@@ -225,10 +245,10 @@ async function runTranslationJob(jobId: string) {
       throw new Error(`Video file not found at ${videoFilePath}`);
     }
 
-    // Step 1: Extract Audio
     job.status = 'extracting_audio';
     job.currentStepText = 'Extracting speech audio track with FFmpeg...';
     job.progress = 15;
+    saveJob(job);
 
     const jobWorkDir = path.join(PROCESSED_DIR, jobId);
     if (!fs.existsSync(jobWorkDir)) {
@@ -238,27 +258,22 @@ async function runTranslationJob(jobId: string) {
     const fullAudioPath = path.join(jobWorkDir, 'audio_full.mp3');
     await extractAudio(videoFilePath, fullAudioPath);
 
-    // Get exact audio duration
     const realDuration = await getVideoDuration(fullAudioPath);
     if (realDuration > 0) {
       job.duration = realDuration;
     }
 
-    // Step 2: Segment audio for long video handling
-    // Segment size: 60 seconds each.
     const segmentDuration = 60;
     const segmentFiles = await segmentAudio(fullAudioPath, jobWorkDir, segmentDuration);
     job.totalSegments = segmentFiles.length || 1;
     job.completedSegments = 0;
 
-    // Step 3: Detect Hindi speech & Translate
     job.status = 'detecting_speech';
     job.currentStepText = `Detecting Hindi dialogue and transcribing (${job.totalSegments} segment${job.totalSegments > 1 ? 's' : ''})...`;
     job.progress = 30;
+    saveJob(job);
 
     const ai = getGeminiClient();
-
-    // Process segments concurrently with up to 3 parallel requests for 3x-5x speedup
     const accumulatedSubtitles: SubtitleCue[] = [];
     const CONCURRENCY_LIMIT = 3;
     let completedCount = 0;
@@ -270,23 +285,7 @@ async function runTranslationJob(jobId: string) {
       try {
         const audioBuffer = fs.readFileSync(segFile);
         const base64Audio = audioBuffer.toString('base64');
-
-        const prompt = `You are a world-class professional Hindi-to-English cinema & video translator and subtitler.
-Your task is to transcribe Hindi or Hinglish spoken dialogue in this audio clip, and translate it into clear, natural, modern English subtitles.
-
-CRITICAL TRANSLATION RULES:
-1. Detect any Hindi, Urdu, or Hinglish speech in this audio clip.
-2. Transcribe the Hindi dialogue accurately.
-3. Translate into natural, high-quality, conversational English:
-   - Preserve Indian cultural context, idioms, humor, and colloquial nuances (e.g., "Arre yaar", "Bhai", "Chalo", "Jugaad", "Kya baat hai").
-   - Maintain the correct emotional tone, sarcasm, urgency, or affection.
-   - Do NOT translate literally word-by-word if it sounds awkward in English. Provide natural cinematic English subtitles.
-4. Distinguish different speakers if multiple people are talking (e.g. "Speaker 1", "Speaker 2", or character names if mentioned).
-5. Accurate Timestamps:
-   - Provide "startSeconds" and "endSeconds" relative to THIS segment (from 0.0 to ${segmentDuration}.0 seconds).
-   - Sync the subtitle start and end precisely with when the speaker begins and stops speaking.
-6. Ignore background music, sound effects, ambient noise, and silence. Do NOT invent dialogue.
-7. If there is no speech in this audio segment, set hasSpeech to false and return an empty subtitles array.`;
+        const prompt = buildTranslationPrompt(segmentDuration);
 
         const response = await ai.models.generateContent({
           model: 'gemini-3.8-flash',
@@ -359,10 +358,10 @@ CRITICAL TRANSLATION RULES:
         job.subtitles = [...accumulatedSubtitles].sort((a, b) => a.startTime - b.startTime);
         job.progress = Math.round(30 + (completedCount / segmentFiles.length) * 60);
         job.currentStepText = `Translated ${completedCount} of ${segmentFiles.length} dialogue segments...`;
+        saveJob(job);
       }
     };
 
-    // Execute with worker pool
     const queue = segmentFiles.map((_, idx) => idx);
     const workers = Array.from({ length: Math.min(CONCURRENCY_LIMIT, queue.length) }, async () => {
       while (queue.length > 0) {
@@ -374,12 +373,11 @@ CRITICAL TRANSLATION RULES:
     });
     await Promise.all(workers);
 
-    // Step 4: Synchronizing and Finalizing
     job.status = 'synchronizing';
     job.currentStepText = 'Synchronizing timestamps and formatting subtitle tracks...';
     job.progress = 95;
+    saveJob(job);
 
-    // Generate SRT and VTT files on disk
     const srtContent = generateSrtContent(job.subtitles);
     const vttContent = generateVttContent(job.subtitles);
 
@@ -394,17 +392,19 @@ CRITICAL TRANSLATION RULES:
     job.status = 'completed';
     job.progress = 100;
     job.currentStepText = 'Translation and subtitle synchronization completed successfully!';
+    saveJob(job);
 
   } catch (err: any) {
     console.error('Translation job failed:', err);
     job.status = 'error';
     job.error = err.message || 'An error occurred during audio extraction or Gemini translation.';
     job.currentStepText = `Error: ${job.error}`;
+    saveJob(job);
   }
 }
 
 // Media file streaming with Range support for video player seeking
-app.get('/media/:folder/:filename', (req, res) => {
+const handleMediaStream = (req: express.Request, res: express.Response) => {
   const { folder, filename } = req.params;
   const baseDir = folder === 'uploads' ? UPLOADS_DIR : folder === 'processed' ? PROCESSED_DIR : SAMPLES_DIR;
   const safeFilename = path.basename(filename);
@@ -425,6 +425,7 @@ app.get('/media/:folder/:filename', (req, res) => {
     '.mkv': 'video/x-matroska',
     '.webm': 'video/webm',
     '.mp3': 'audio/mpeg',
+    '.wav': 'audio/wav',
     '.vtt': 'text/vtt',
     '.srt': 'text/plain'
   };
@@ -453,12 +454,177 @@ app.get('/media/:folder/:filename', (req, res) => {
     res.writeHead(200, head);
     fs.createReadStream(filePath).pipe(res);
   }
+};
+
+app.get('/media/:folder/:filename', handleMediaStream);
+app.get('/api/media/:folder/:filename', handleMediaStream);
+
+// Create an Express Router for API routes
+// This allows identical handling whether mounted at /api or root / (handling Vercel rewrites gracefully)
+const apiRouter = express.Router();
+
+// Health Check
+apiRouter.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'SUBLYAI',
+    serverless: IS_SERVERLESS,
+    hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
+    time: Date.now()
+  });
 });
 
-// API Routes
+// FAST TRANSLATE AUDIO ENDPOINT:
+// Accepts base64 audio segment (16kHz mono WAV from browser), translates synchronously with Gemini,
+// and returns high-accuracy English subtitles with millisecond timestamps.
+apiRouter.post('/translate-audio', async (req, res) => {
+  try {
+    const { audioBase64, mimeType = 'audio/wav', offsetSeconds = 0, segmentDuration = 60, jobId } = req.body;
 
-// 1. Direct file upload with error handling
-app.post('/api/upload', (req, res) => {
+    if (!audioBase64) {
+      return res.status(400).json({ error: 'Missing audioBase64 in request body' });
+    }
+
+    const ai = getGeminiClient();
+    const prompt = buildTranslationPrompt(Number(segmentDuration) || 60);
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash',
+      contents: [
+        {
+          inlineData: {
+            mimeType: mimeType || 'audio/wav',
+            data: audioBase64,
+          }
+        },
+        {
+          text: prompt
+        }
+      ],
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            hasSpeech: { type: Type.BOOLEAN },
+            detectedLanguage: { type: Type.STRING },
+            subtitles: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  startSeconds: { type: Type.NUMBER },
+                  endSeconds: { type: Type.NUMBER },
+                  hindiText: { type: Type.STRING },
+                  englishText: { type: Type.STRING },
+                  speaker: { type: Type.STRING }
+                },
+                required: ['startSeconds', 'endSeconds', 'hindiText', 'englishText']
+              }
+            }
+          },
+          required: ['hasSpeech', 'subtitles']
+        }
+      }
+    });
+
+    const rawText = response.text || '{}';
+    let parsed: any;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      parsed = { hasSpeech: false, subtitles: [] };
+    }
+
+    const baseOffset = Number(offsetSeconds) || 0;
+    const generatedCues: SubtitleCue[] = [];
+
+    if (parsed.subtitles && Array.isArray(parsed.subtitles)) {
+      for (const item of parsed.subtitles) {
+        const rawStart = Number(item.startSeconds) || 0;
+        const rawEnd = Number(item.endSeconds) || (rawStart + 2.5);
+
+        const startSec = Math.max(0, baseOffset + rawStart);
+        const endSec = Math.max(startSec + 0.4, baseOffset + rawEnd);
+
+        if (item.englishText && item.englishText.trim()) {
+          generatedCues.push({
+            id: `cue_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+            startTime: Number(startSec.toFixed(2)),
+            endTime: Number(endSec.toFixed(2)),
+            hindiText: (item.hindiText || '').trim(),
+            englishText: (item.englishText || '').trim(),
+            speaker: (item.speaker || 'Speaker').trim()
+          });
+        }
+      }
+    }
+
+    // If a jobId was provided, update the stored job on the server
+    if (jobId) {
+      const existingJob = getJob(jobId);
+      if (existingJob) {
+        const combined = [...(existingJob.subtitles || []), ...generatedCues].sort((a, b) => a.startTime - b.startTime);
+        // Deduplicate cues with identical start & text
+        const seen = new Set<string>();
+        existingJob.subtitles = combined.filter(c => {
+          const key = `${c.startTime}_${c.englishText}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+        saveJob(existingJob);
+      }
+    }
+
+    res.json({
+      success: true,
+      hasSpeech: Boolean(parsed.hasSpeech),
+      detectedLanguage: parsed.detectedLanguage || 'Hindi',
+      subtitles: generatedCues
+    });
+
+  } catch (err: any) {
+    console.error('Fast audio translation error:', err);
+    res.status(500).json({
+      error: err.message || 'Failed to translate audio with Gemini API',
+      success: false
+    });
+  }
+});
+
+// Create/Register a job on server
+apiRouter.post('/jobs/create', (req, res) => {
+  try {
+    const { id, fileName, fileSize, duration, videoUrl } = req.body;
+    if (!id || !fileName) {
+      return res.status(400).json({ error: 'Missing id or fileName' });
+    }
+
+    const job: TranslationJob = {
+      id,
+      fileName,
+      fileSize: Number(fileSize) || 0,
+      duration: Number(duration) || 0,
+      videoUrl: videoUrl || '',
+      status: 'idle',
+      progress: 0,
+      currentStepText: 'Job initialized',
+      totalSegments: 1,
+      completedSegments: 0,
+      subtitles: [],
+      createdAt: Date.now()
+    };
+
+    saveJob(job);
+    res.json({ success: true, job });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to create job' });
+  }
+});
+
+// Direct file upload
+apiRouter.post('/upload', (req, res) => {
   upload.single('video')(req, res, async (err) => {
     if (err) {
       console.error('Direct upload multer error:', err);
@@ -488,7 +654,7 @@ app.post('/api/upload', (req, res) => {
         createdAt: Date.now()
       };
 
-      jobs.set(jobId, job);
+      saveJob(job);
       res.json({ success: true, job });
     } catch (routeErr: any) {
       console.error('Upload processing error:', routeErr);
@@ -497,17 +663,21 @@ app.post('/api/upload', (req, res) => {
   });
 });
 
-// 2. Chunked upload API for large videos (bypasses Cloud Run 32MB payload limit)
-app.post('/api/upload/init', (req, res) => {
-  const { fileName, totalSize } = req.body;
-  const uploadId = 'chunk_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
-  const uploadDir = path.join(CHUNKS_DIR, uploadId);
-  fs.mkdirSync(uploadDir, { recursive: true });
+// Chunked upload endpoints
+apiRouter.post('/upload/init', (req, res) => {
+  try {
+    const { fileName, totalSize } = req.body;
+    const uploadId = 'chunk_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+    const uploadDir = path.join(CHUNKS_DIR, uploadId);
+    fs.mkdirSync(uploadDir, { recursive: true });
 
-  res.json({ uploadId, fileName, totalSize });
+    res.json({ uploadId, fileName, totalSize });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to init chunk upload: ' + err.message });
+  }
 });
 
-app.post('/api/upload/chunk', (req, res) => {
+apiRouter.post('/upload/chunk', (req, res) => {
   chunkUpload.single('chunk')(req, res, (err) => {
     if (err) {
       console.error('Chunk upload multer error:', err);
@@ -521,7 +691,9 @@ app.post('/api/upload/chunk', (req, res) => {
 
     const uploadDir = path.join(CHUNKS_DIR, uploadId);
     if (!fs.existsSync(uploadDir)) {
-      return res.status(404).json({ error: 'Upload session expired or invalid' });
+      try {
+        fs.mkdirSync(uploadDir, { recursive: true });
+      } catch {}
     }
 
     const chunkPath = path.join(uploadDir, `chunk_${String(chunkIndex).padStart(5, '0')}`);
@@ -531,65 +703,70 @@ app.post('/api/upload/chunk', (req, res) => {
   });
 });
 
-app.post('/api/upload/complete', async (req, res) => {
-  const { uploadId, fileName } = req.body;
-  const uploadDir = path.join(CHUNKS_DIR, uploadId);
+apiRouter.post('/upload/complete', async (req, res) => {
+  try {
+    const { uploadId, fileName } = req.body;
+    const uploadDir = path.join(CHUNKS_DIR, uploadId);
 
-  if (!fs.existsSync(uploadDir)) {
-    return res.status(404).json({ error: 'Upload session not found' });
+    if (!fs.existsSync(uploadDir)) {
+      return res.status(404).json({ error: 'Upload session not found' });
+    }
+
+    const chunkFiles = fs.readdirSync(uploadDir)
+      .filter(f => f.startsWith('chunk_'))
+      .sort();
+
+    const ext = path.extname(fileName) || '.mp4';
+    const cleanBase = path.basename(fileName, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const targetFileName = `${cleanBase}_${Date.now()}${ext}`;
+    const targetPath = path.join(UPLOADS_DIR, targetFileName);
+
+    const writeStream = fs.createWriteStream(targetPath);
+    for (const chunkFile of chunkFiles) {
+      const chunkFilePath = path.join(uploadDir, chunkFile);
+      const data = fs.readFileSync(chunkFilePath);
+      writeStream.write(data);
+    }
+    writeStream.end();
+
+    await new Promise<void>((resolve) => {
+      writeStream.on('finish', () => resolve());
+    });
+
+    try {
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+    } catch {}
+
+    const duration = await getVideoDuration(targetPath);
+    const stat = fs.statSync(targetPath);
+
+    const jobId = 'job_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+    const job: TranslationJob = {
+      id: jobId,
+      fileName: targetFileName,
+      fileSize: stat.size,
+      videoUrl: `/media/uploads/${targetFileName}`,
+      duration: duration || 0,
+      status: 'idle',
+      progress: 0,
+      currentStepText: 'Video assembled. Ready for AI translation.',
+      totalSegments: 1,
+      completedSegments: 0,
+      subtitles: [],
+      createdAt: Date.now()
+    };
+
+    saveJob(job);
+    res.json({ success: true, job });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to assemble video: ' + err.message });
   }
-
-  const chunkFiles = fs.readdirSync(uploadDir)
-    .filter(f => f.startsWith('chunk_'))
-    .sort();
-
-  const ext = path.extname(fileName) || '.mp4';
-  const cleanBase = path.basename(fileName, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
-  const targetFileName = `${cleanBase}_${Date.now()}${ext}`;
-  const targetPath = path.join(UPLOADS_DIR, targetFileName);
-
-  const writeStream = fs.createWriteStream(targetPath);
-  for (const chunkFile of chunkFiles) {
-    const chunkFilePath = path.join(uploadDir, chunkFile);
-    const data = fs.readFileSync(chunkFilePath);
-    writeStream.write(data);
-  }
-  writeStream.end();
-
-  await new Promise<void>((resolve) => {
-    writeStream.on('finish', () => resolve());
-  });
-
-  // Clean chunk directory
-  fs.rmSync(uploadDir, { recursive: true, force: true });
-
-  const duration = await getVideoDuration(targetPath);
-  const stat = fs.statSync(targetPath);
-
-  const jobId = 'job_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
-  const job: TranslationJob = {
-    id: jobId,
-    fileName: targetFileName,
-    fileSize: stat.size,
-    videoUrl: `/media/uploads/${targetFileName}`,
-    duration: duration || 0,
-    status: 'idle',
-    progress: 0,
-    currentStepText: 'Video assembled. Ready for AI translation.',
-    totalSegments: 1,
-    completedSegments: 0,
-    subtitles: [],
-    createdAt: Date.now()
-  };
-
-  jobs.set(jobId, job);
-  res.json({ success: true, job });
 });
 
-// 3. Start AI translation
-app.post('/api/jobs/:id/start', (req, res) => {
+// Start AI translation job
+apiRouter.post('/jobs/:id/start', (req, res) => {
   const { id } = req.params;
-  const job = jobs.get(id);
+  const job = getJob(id);
 
   if (!job) {
     return res.status(404).json({ error: 'Job not found' });
@@ -603,8 +780,8 @@ app.post('/api/jobs/:id/start', (req, res) => {
   job.progress = 5;
   job.currentStepText = 'Starting translation pipeline...';
   job.error = undefined;
+  saveJob(job);
 
-  // Run in background so user doesn't wait
   runTranslationJob(id).catch(err => {
     console.error('Job execution error:', err);
   });
@@ -612,10 +789,10 @@ app.post('/api/jobs/:id/start', (req, res) => {
   res.json({ success: true, job });
 });
 
-// 4. Poll job status & progressive subtitles
-app.get('/api/jobs/:id', (req, res) => {
+// Poll job status & progressive subtitles
+apiRouter.get('/jobs/:id', (req, res) => {
   const { id } = req.params;
-  const job = jobs.get(id);
+  const job = getJob(id);
 
   if (!job) {
     return res.status(404).json({ error: 'Job not found' });
@@ -624,10 +801,29 @@ app.get('/api/jobs/:id', (req, res) => {
   res.json({ job });
 });
 
-// 5. Update subtitles from Subtitle Editor
-app.put('/api/jobs/:id/subtitles', (req, res) => {
+// Update job progress directly from client
+apiRouter.post('/jobs/:id/update-progress', (req, res) => {
   const { id } = req.params;
-  const job = jobs.get(id);
+  const { status, progress, currentStepText, subtitles } = req.body;
+  const job = getJob(id);
+
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+
+  if (status) job.status = status;
+  if (typeof progress === 'number') job.progress = progress;
+  if (currentStepText) job.currentStepText = currentStepText;
+  if (Array.isArray(subtitles)) job.subtitles = subtitles;
+
+  saveJob(job);
+  res.json({ success: true, job });
+});
+
+// Update subtitles from Subtitle Editor
+apiRouter.put('/jobs/:id/subtitles', (req, res) => {
+  const { id } = req.params;
+  const job = getJob(id);
 
   if (!job) {
     return res.status(404).json({ error: 'Job not found' });
@@ -639,23 +835,26 @@ app.put('/api/jobs/:id/subtitles', (req, res) => {
   }
 
   job.subtitles = subtitles;
+  saveJob(job);
 
-  // Update on-disk files if present
   const jobWorkDir = path.join(PROCESSED_DIR, id);
-  if (fs.existsSync(jobWorkDir)) {
+  try {
+    if (!fs.existsSync(jobWorkDir)) {
+      fs.mkdirSync(jobWorkDir, { recursive: true });
+    }
     const srtContent = generateSrtContent(job.subtitles);
     const vttContent = generateVttContent(job.subtitles);
     fs.writeFileSync(path.join(jobWorkDir, 'subtitles.srt'), srtContent, 'utf-8');
     fs.writeFileSync(path.join(jobWorkDir, 'subtitles.vtt'), vttContent, 'utf-8');
-  }
+  } catch {}
 
   res.json({ success: true, subtitles: job.subtitles });
 });
 
-// 6. Download SRT
-app.get('/api/jobs/:id/download/srt', (req, res) => {
+// Download SRT
+apiRouter.get('/jobs/:id/download/srt', (req, res) => {
   const { id } = req.params;
-  const job = jobs.get(id);
+  const job = getJob(id);
 
   if (!job) {
     return res.status(404).send('Job not found');
@@ -669,10 +868,10 @@ app.get('/api/jobs/:id/download/srt', (req, res) => {
   res.send(srt);
 });
 
-// 7. Download VTT
-app.get('/api/jobs/:id/download/vtt', (req, res) => {
+// Download VTT
+apiRouter.get('/jobs/:id/download/vtt', (req, res) => {
   const { id } = req.params;
-  const job = jobs.get(id);
+  const job = getJob(id);
 
   if (!job) {
     return res.status(404).send('Job not found');
@@ -686,10 +885,10 @@ app.get('/api/jobs/:id/download/vtt', (req, res) => {
   res.send(vtt);
 });
 
-// 8. Burn subtitles permanently into video using FFmpeg (Option C)
-app.post('/api/jobs/:id/burn', async (req, res) => {
+// Burn subtitles into video
+apiRouter.post('/jobs/:id/burn', async (req, res) => {
   const { id } = req.params;
-  const job = jobs.get(id);
+  const job = getJob(id);
 
   if (!job) {
     return res.status(404).json({ error: 'Job not found' });
@@ -709,18 +908,22 @@ app.post('/api/jobs/:id/burn', async (req, res) => {
     fs.writeFileSync(srtPath, generateSrtContent(job.subtitles), 'utf-8');
 
     const inputVideoPath = path.join(UPLOADS_DIR, job.fileName);
+    if (!fs.existsSync(inputVideoPath)) {
+      return res.status(400).json({
+        error: 'Video file not found on server for hardcoding. On serverless hosting (Vercel), please download the universal .SRT or .VTT subtitles to use with your video player.'
+      });
+    }
+
     const outputVideoName = `subtitled_${job.fileName}`;
     const outputVideoPath = path.join(PROCESSED_DIR, outputVideoName);
-
-    // Escape srt path for FFmpeg subtitles filter
     const escapedSrt = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
     
-    // Render subtitles with high-contrast styling: bold, white text with black outline and soft shadow
     const cmd = `${FFMPEG_BIN} -y -threads 0 -i "${inputVideoPath}" -vf "subtitles='${escapedSrt}':force_style='FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=1,MarginV=35'" -c:v libx264 -preset ultrafast -crf 23 -c:a copy "${outputVideoPath}"`;
 
     await execAsync(cmd);
 
     job.burnedVideoUrl = `/media/processed/${outputVideoName}`;
+    saveJob(job);
 
     res.json({
       success: true,
@@ -729,14 +932,15 @@ app.post('/api/jobs/:id/burn', async (req, res) => {
     });
   } catch (err: any) {
     console.error('Burn subtitles failed:', err);
-    res.status(500).json({ error: 'Failed to burn subtitles into video: ' + (err.message || 'FFmpeg error') });
+    res.status(500).json({
+      error: 'Failed to burn subtitles into video. Note: Video burning requires server-side FFmpeg. For instant results, download .SRT or .VTT subtitles above.'
+    });
   }
 });
 
-// Direct download for burned video
-app.get('/api/jobs/:id/download/video', (req, res) => {
+apiRouter.get('/jobs/:id/download/video', (req, res) => {
   const { id } = req.params;
-  const job = jobs.get(id);
+  const job = getJob(id);
 
   if (!job) {
     return res.status(404).send('Job not found');
@@ -746,14 +950,14 @@ app.get('/api/jobs/:id/download/video', (req, res) => {
   const outputVideoPath = path.join(PROCESSED_DIR, outputVideoName);
 
   if (!fs.existsSync(outputVideoPath)) {
-    return res.status(404).send('Burned video not ready yet. Please trigger rendering first.');
+    return res.status(404).send('Burned video not ready yet.');
   }
 
   const baseName = path.basename(job.fileName, path.extname(job.fileName));
   res.download(outputVideoPath, `${baseName}_EnglishSubtitled.mp4`);
 });
 
-// Built-in Hindi sample clips for immediate testing
+// Built-in Hindi sample clips
 const SAMPLE_VIDEOS = [
   {
     id: 'sample_bollywood_drama',
@@ -904,36 +1108,13 @@ const SAMPLE_VIDEOS = [
   }
 ];
 
-// Initialize sample video files if they don't exist yet using ffmpeg
-async function ensureSampleFiles() {
-  for (const s of SAMPLE_VIDEOS) {
-    const videoFileName = `${s.id}.mp4`;
-    const targetPath = path.join(SAMPLES_DIR, videoFileName);
-    if (!fs.existsSync(targetPath)) {
-      try {
-        // Generate a crisp, clean 1080p sample video clip with visual scene indicator and audio tone
-        const dur = 32;
-        const color = s.id === 'sample_bollywood_drama' ? '#1e1b4b' : s.id === 'sample_startup_pitch' ? '#0f172a' : '#14532d';
-        const titleText = s.title.replace(/'/g, "\\'");
-        
-        // Use FFmpeg to generate clean video with title text & timestamp burned in
-        const cmd = `${FFMPEG_BIN} -y -f lavfi -i "color=c=${color}:s=1280x720:d=${dur}" -f lavfi -i "sine=frequency=320:duration=${dur}" -vf "drawtext=text='${titleText}':fontcolor=white:fontsize=36:x=(w-text_w)/2:y=(h-text_h)/2-40,drawtext=text='SUBLYAI Hindi Dialogue Sample Stream':fontcolor=0x9333ea:fontsize=22:x=(w-text_w)/2:y=(h-text_h)/2+30" -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "${targetPath}"`;
-        await execAsync(cmd);
-      } catch (err) {
-        console.warn('Failed to pre-generate sample video', s.id, err);
-      }
-    }
-  }
-}
-ensureSampleFiles().catch(console.error);
-
 // 9. Get sample videos
-app.get('/api/samples', (_req, res) => {
+apiRouter.get('/samples', (_req, res) => {
   res.json({ samples: SAMPLE_VIDEOS });
 });
 
 // 10. Load sample video directly into a new job
-app.post('/api/samples/:sampleId/load', (req, res) => {
+apiRouter.post('/samples/:sampleId/load', (req, res) => {
   const { sampleId } = req.params;
   const sample = SAMPLE_VIDEOS.find(s => s.id === sampleId);
 
@@ -944,19 +1125,10 @@ app.post('/api/samples/:sampleId/load', (req, res) => {
   const jobId = 'sample_job_' + Date.now();
   const videoFileName = `${sample.id}.mp4`;
 
-  // Copy sample to uploads directory if not already there
-  const sampleSource = path.join(SAMPLES_DIR, videoFileName);
-  const uploadDest = path.join(UPLOADS_DIR, videoFileName);
-  try {
-    if (fs.existsSync(sampleSource) && !fs.existsSync(uploadDest)) {
-      fs.copyFileSync(sampleSource, uploadDest);
-    }
-  } catch {}
-
   const job: TranslationJob = {
     id: jobId,
     fileName: videoFileName,
-    fileSize: fs.existsSync(sampleSource) ? fs.statSync(sampleSource).size : 2500000,
+    fileSize: 2500000,
     videoUrl: `/media/samples/${videoFileName}`,
     duration: 32,
     status: 'completed',
@@ -968,7 +1140,6 @@ app.post('/api/samples/:sampleId/load', (req, res) => {
     createdAt: Date.now()
   };
 
-  // Generate on-disk SRT and VTT for sample
   const jobWorkDir = path.join(PROCESSED_DIR, jobId);
   try {
     if (!fs.existsSync(jobWorkDir)) {
@@ -985,11 +1156,16 @@ app.post('/api/samples/:sampleId/load', (req, res) => {
   res.json({ success: true, job });
 });
 
+// Mount the API router at BOTH /api and / to handle all routing environments seamlessly
+app.use('/api', apiRouter);
+app.use('/', apiRouter);
+
 // Setup Vite middleware in Dev or serve static in Prod
 async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
 
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa'

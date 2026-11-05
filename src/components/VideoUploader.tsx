@@ -1,23 +1,21 @@
 import React, { useState, useRef, useCallback } from 'react';
 import { Upload, FileVideo, X, CheckCircle2, AlertCircle, Sparkles, Film, ArrowRight, Zap, RefreshCw } from 'lucide-react';
 import type { TranslationJob } from '../types';
+import { createLocalJob } from '../services/translationService';
 
 interface VideoUploaderProps {
-  onJobCreated: (job: TranslationJob) => void;
+  onJobCreated: (job: TranslationJob, file?: File) => void;
   onOpenSamples: () => void;
+  onStartTranslation?: (file: File, durationSec: number | null) => void;
 }
 
-export const VideoUploader: React.FC<VideoUploaderProps> = ({ onJobCreated, onOpenSamples }) => {
+export const VideoUploader: React.FC<VideoUploaderProps> = ({ onJobCreated, onOpenSamples, onStartTranslation }) => {
   const [dragActive, setDragActive] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [videoPreviewUrl, setVideoPreviewUrl] = useState<string | null>(null);
   const [durationSec, setDurationSec] = useState<number | null>(null);
-  const [isUploading, setIsUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [uploadStatusText, setUploadStatusText] = useState<string>('');
 
-  const abortControllerRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const handleFile = (file: File) => {
@@ -62,17 +60,6 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({ onJobCreated, onOp
     }
   }, []);
 
-  const handleCancelUpload = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-    setIsUploading(false);
-    setUploadProgress(0);
-    setUploadStatusText('');
-    setErrorMessage('Upload cancelled.');
-  };
-
   const handleClearSelected = () => {
     if (videoPreviewUrl) {
       URL.revokeObjectURL(videoPreviewUrl);
@@ -81,8 +68,6 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({ onJobCreated, onOp
     setVideoPreviewUrl(null);
     setDurationSec(null);
     setErrorMessage(null);
-    setUploadProgress(0);
-    setUploadStatusText('');
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -100,210 +85,14 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({ onJobCreated, onOp
     return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
   };
 
-  // Resilient Chunked Upload supporting any file size, completely immune to Vercel 4.5MB and Cloud Run limits
-  const uploadViaChunks = async (file: File, signal: AbortSignal): Promise<TranslationJob> => {
-    // 2.5MB per chunk ensures payload is always safely under Vercel's strict 4.5MB serverless limit
-    const CHUNK_SIZE = Math.floor(2.5 * 1024 * 1024);
-    const totalSize = file.size;
-    const totalChunks = Math.ceil(totalSize / CHUNK_SIZE);
-
-    setUploadStatusText(`Initializing upload session (${totalChunks} chunks)...`);
-
-    // 1. Initialize upload session
-    let initRes: Response;
-    try {
-      initRes = await fetch('/api/upload/init', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileName: file.name, totalSize }),
-        signal
-      });
-    } catch (netErr: any) {
-      throw new Error(`Cannot connect to upload server: ${netErr.message || 'Network error'}. Check that your deployment backend is running.`);
-    }
-
-    if (!initRes.ok) {
-      const err = await initRes.json().catch(() => ({}));
-      if (initRes.status === 404) {
-        throw new Error('Upload API not found (HTTP 404). On Vercel, verify that vercel.json rewrites are deployed and GEMINI_API_KEY is configured in Settings > Environment Variables.');
-      }
-      throw new Error(err.error || `Failed to initialize upload session (HTTP ${initRes.status})`);
-    }
-
-    const { uploadId } = await initRes.json();
-
-    // 2. Upload chunks with 3 parallel concurrent workers for maximum speed
-    const uploadedBytes = new Array(totalChunks).fill(0);
-    let completedChunks = 0;
-    const CONCURRENCY = 3;
-
-    const uploadSingleChunk = async (chunkIndex: number, attempt = 1): Promise<void> => {
-      const start = chunkIndex * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, totalSize);
-      const chunkBlob = file.slice(start, end);
-
-      const formData = new FormData();
-      formData.append('uploadId', uploadId);
-      formData.append('chunkIndex', chunkIndex.toString());
-      formData.append('chunk', chunkBlob, 'chunk');
-
-      try {
-        const res = await fetch('/api/upload/chunk', {
-          method: 'POST',
-          body: formData,
-          signal
-        });
-
-        if (!res.ok) {
-          if (attempt <= 3) {
-            await new Promise((r) => setTimeout(r, 500 * attempt));
-            return uploadSingleChunk(chunkIndex, attempt + 1);
-          }
-          throw new Error(`Chunk ${chunkIndex + 1} upload failed`);
-        }
-
-        completedChunks++;
-        uploadedBytes[chunkIndex] = chunkBlob.size;
-        const totalUploaded = uploadedBytes.reduce((a, b) => a + b, 0);
-        const percent = Math.min(95, Math.round((totalUploaded / totalSize) * 100));
-        setUploadProgress(percent);
-        setUploadStatusText(`Uploaded ${completedChunks} of ${totalChunks} chunks (${percent}%)...`);
-      } catch (err: any) {
-        if (err.name === 'AbortError') throw err;
-        if (attempt <= 3) {
-          await new Promise((r) => setTimeout(r, 500 * attempt));
-          return uploadSingleChunk(chunkIndex, attempt + 1);
-        }
-        throw err;
-      }
-    };
-
-    // Worker queue
-    const queue = Array.from({ length: totalChunks }, (_, i) => i);
-    const workers = Array.from({ length: Math.min(CONCURRENCY, totalChunks) }, async () => {
-      while (queue.length > 0) {
-        const nextIndex = queue.shift();
-        if (nextIndex !== undefined) {
-          await uploadSingleChunk(nextIndex);
-        }
-      }
-    });
-
-    await Promise.all(workers);
-
-    // 3. Assemble and complete on server
-    setUploadStatusText('Assembling video on server...');
-    setUploadProgress(98);
-
-    const completeRes = await fetch('/api/upload/complete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ uploadId, fileName: file.name }),
-      signal
-    });
-
-    if (!completeRes.ok) {
-      const err = await completeRes.json().catch(() => ({}));
-      throw new Error(err.error || 'Failed to assemble video');
-    }
-
-    const completeData = await completeRes.json();
-    return completeData.job;
-  };
-
-  // Direct single-request upload for small files (< 15MB)
-  const uploadDirect = (file: File, signal: AbortSignal): Promise<TranslationJob> => {
-    return new Promise((resolve, reject) => {
-      const formData = new FormData();
-      formData.append('video', file);
-
-      const xhr = new XMLHttpRequest();
-
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) {
-          const pct = Math.min(95, Math.round((e.loaded / e.total) * 100));
-          setUploadProgress(pct);
-          setUploadStatusText(`Uploading ${pct}%...`);
-        }
-      };
-
-      xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          try {
-            const data = JSON.parse(xhr.responseText);
-            resolve(data.job);
-          } catch (e: any) {
-            reject(new Error('Invalid response from server: ' + e.message));
-          }
-        } else {
-          try {
-            const errData = JSON.parse(xhr.responseText);
-            reject(new Error(errData.error || `Upload returned HTTP ${xhr.status}`));
-          } catch {
-            reject(new Error(`Upload returned HTTP ${xhr.status}`));
-          }
-        }
-      };
-
-      xhr.onerror = () => reject(new Error('Network connection error during direct upload'));
-      xhr.onabort = () => reject(new DOMException('Upload cancelled', 'AbortError'));
-
-      signal.addEventListener('abort', () => xhr.abort());
-      xhr.open('POST', '/api/upload', true);
-      xhr.send(formData);
-    });
-  };
-
-  // Main Upload orchestrator
-  const handleStartUploadAndTranslate = async () => {
+  const handleStart = () => {
     if (!selectedFile) return;
 
-    setIsUploading(true);
-    setUploadProgress(2);
-    setErrorMessage(null);
-    setUploadStatusText('Starting fast upload...');
-
-    const abortController = new AbortController();
-    abortControllerRef.current = abortController;
-
-    try {
-      let createdJob: TranslationJob;
-
-      // If file is > 3.5MB, use chunked upload directly to stay safely within Vercel's 4.5MB serverless limit
-      if (selectedFile.size > 3.5 * 1024 * 1024) {
-        createdJob = await uploadViaChunks(selectedFile, abortController.signal);
-      } else {
-        try {
-          createdJob = await uploadDirect(selectedFile, abortController.signal);
-        } catch (directErr: any) {
-          if (directErr.name === 'AbortError') throw directErr;
-          console.warn('Direct upload failed, falling back to chunked upload:', directErr);
-          setUploadStatusText('Switching to resilient chunked upload...');
-          createdJob = await uploadViaChunks(selectedFile, abortController.signal);
-        }
-      }
-
-      setUploadProgress(100);
-      setUploadStatusText('Starting AI Hindi translation...');
-
-      // Trigger background translation pipeline
-      const startRes = await fetch(`/api/jobs/${createdJob.id}/start`, { method: 'POST' });
-      if (startRes.ok) {
-        const startData = await startRes.json();
-        onJobCreated(startData.job || createdJob);
-      } else {
-        onJobCreated(createdJob);
-      }
-    } catch (err: any) {
-      if (err.name === 'AbortError') {
-        setErrorMessage('Upload cancelled.');
-      } else {
-        console.error('Upload failed:', err);
-        setErrorMessage(err.message || 'Video upload failed. Please try again.');
-      }
-    } finally {
-      setIsUploading(false);
-      abortControllerRef.current = null;
+    if (onStartTranslation) {
+      onStartTranslation(selectedFile, durationSec);
+    } else {
+      const job = createLocalJob(selectedFile, durationSec || 0);
+      onJobCreated(job, selectedFile);
     }
   };
 
@@ -317,11 +106,11 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({ onJobCreated, onOp
               Upload Hindi Video
               <span className="text-[11px] font-normal text-purple-300 bg-purple-950/80 px-2 py-0.5 rounded border border-purple-500/30 flex items-center gap-1">
                 <Zap className="w-3 h-3 text-purple-400 fill-current" />
-                Resilient Fast Stream
+                Ultra-Fast Processing
               </span>
             </h2>
             <p className="text-xs text-slate-400 mt-1">
-              Supports MP4, MOV, MKV, and WEBM. Uploads stream smoothly with chunked protection.
+              Supports MP4, MOV, MKV, and WEBM. Audio is extracted directly in your browser with zero upload waiting.
             </p>
           </div>
 
@@ -335,7 +124,7 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({ onJobCreated, onOp
           </button>
         </div>
 
-        {/* Error Alert with Retry button */}
+        {/* Error Alert */}
         {errorMessage && (
           <div className="mt-5 p-3.5 rounded-xl bg-red-950/50 border border-red-500/30 text-red-200 text-xs flex items-start gap-3">
             <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
@@ -346,7 +135,7 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({ onJobCreated, onOp
             <button
               onClick={() => {
                 setErrorMessage(null);
-                handleStartUploadAndTranslate();
+                handleStart();
               }}
               className="text-purple-300 hover:text-white font-bold flex items-center gap-1 cursor-pointer bg-purple-950 px-2 py-1 rounded border border-purple-500/30"
             >
@@ -389,7 +178,7 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({ onJobCreated, onOp
               Drag & drop your Hindi video here, or <span className="text-purple-400 underline underline-offset-4">browse</span>
             </p>
             <p className="text-xs text-slate-400 mt-1.5 max-w-md">
-              Movies, drama episodes, clips, or interviews up to 1GB. Direct fast streaming.
+              Movies, drama episodes, clips, or interviews up to 1GB. Opens immediately in the Fit-to-Screen Studio.
             </p>
 
             <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
@@ -452,65 +241,32 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({ onJobCreated, onOp
                     </div>
                   </div>
 
-                  {!isUploading && (
-                    <button
-                      onClick={handleClearSelected}
-                      className="p-1 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
-                      title="Remove file"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  )}
+                  <button
+                    onClick={handleClearSelected}
+                    className="p-1 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+                    title="Remove file"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
                 </div>
 
-                {/* Upload Progress Bar if active */}
-                {isUploading && (
-                  <div className="mt-4">
-                    <div className="flex items-center justify-between text-xs mb-1.5">
-                      <span className="text-purple-300 font-medium flex items-center gap-1.5">
-                        <Sparkles className="w-3.5 h-3.5 text-purple-400 animate-spin" />
-                        {uploadStatusText || 'Uploading video to server...'}
-                      </span>
-                      <span className="font-mono text-purple-400 font-bold">{uploadProgress}%</span>
-                    </div>
-                    <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
-                      <div
-                        className="h-full bg-gradient-to-r from-purple-500 to-indigo-500 transition-all duration-200"
-                        style={{ width: `${uploadProgress}%` }}
-                      />
-                    </div>
-                  </div>
-                )}
-
                 {/* Actions */}
-                <div className="mt-4 flex flex-wrap items-center gap-3">
-                  {!isUploading ? (
-                    <>
-                      <button
-                        onClick={handleStartUploadAndTranslate}
-                        className="px-5 py-2.5 text-xs sm:text-sm font-semibold text-white bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 rounded-lg shadow-lg shadow-purple-600/30 flex items-center gap-2 transition-all cursor-pointer transform hover:-translate-y-0.5 active:translate-y-0"
-                      >
-                        <Zap className="w-4 h-4 text-purple-200 fill-current" />
-                        Fast Upload & Translate to English
-                        <ArrowRight className="w-4 h-4" />
-                      </button>
+                <div className="mt-5 flex flex-wrap items-center gap-3">
+                  <button
+                    onClick={handleStart}
+                    className="px-5 py-2.5 text-xs sm:text-sm font-semibold text-white bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 rounded-lg shadow-lg shadow-purple-600/30 flex items-center gap-2 transition-all cursor-pointer transform hover:-translate-y-0.5 active:translate-y-0"
+                  >
+                    <Zap className="w-4 h-4 text-purple-200 fill-current" />
+                    Open Studio & Translate to English
+                    <ArrowRight className="w-4 h-4" />
+                  </button>
 
-                      <button
-                        onClick={handleClearSelected}
-                        className="px-3.5 py-2 text-xs font-medium text-slate-400 hover:text-slate-200 hover:bg-slate-800/80 rounded-lg transition-colors cursor-pointer"
-                      >
-                        Choose Different File
-                      </button>
-                    </>
-                  ) : (
-                    <button
-                      onClick={handleCancelUpload}
-                      className="px-3.5 py-1.5 text-xs font-semibold text-red-400 hover:text-red-300 bg-red-950/40 border border-red-500/30 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                      Cancel Upload
-                    </button>
-                  )}
+                  <button
+                    onClick={handleClearSelected}
+                    className="px-3.5 py-2 text-xs font-medium text-slate-400 hover:text-slate-200 hover:bg-slate-800/80 rounded-lg transition-colors cursor-pointer"
+                  >
+                    Choose Different File
+                  </button>
                 </div>
               </div>
             </div>

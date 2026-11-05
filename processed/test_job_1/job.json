@@ -1,0 +1,1 @@
+{"id":"test_job_1","fileName":"my_hindi_clip.mp4","fileSize":1234567,"duration":45,"videoUrl":"blob:http://localhost/test","status":"idle","progress":0,"currentStepText":"Job initialized","totalSegments":1,"completedSegments":0,"subtitles":[{"id":"c1","startTime":1,"endTime":3,"hindiText":"नमस्ते","englishText":"Hello","speaker":"Speaker 1"}],"createdAt":1793913161639}
