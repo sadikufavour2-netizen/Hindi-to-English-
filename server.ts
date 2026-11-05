@@ -1,11 +1,13 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import multer from 'multer';
 import dotenv from 'dotenv';
+import ffmpegStatic from 'ffmpeg-static';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import type { SubtitleCue, TranslationJob, JobStatus } from './src/types';
@@ -23,17 +25,28 @@ const app = express();
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Directories
-const UPLOADS_DIR = path.resolve(__dirname, 'uploads');
-const PROCESSED_DIR = path.resolve(__dirname, 'processed');
-const CHUNKS_DIR = path.resolve(__dirname, 'uploads/chunks');
-const SAMPLES_DIR = path.resolve(__dirname, 'samples');
+// Determine if running in Vercel or AWS Lambda serverless environment
+const IS_SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+const BASE_STORAGE_DIR = IS_SERVERLESS ? path.join(os.tmpdir(), 'sublyai') : __dirname;
+
+// Directories (using writable /tmp in serverless to prevent EROFS read-only crashes)
+const UPLOADS_DIR = path.resolve(BASE_STORAGE_DIR, 'uploads');
+const PROCESSED_DIR = path.resolve(BASE_STORAGE_DIR, 'processed');
+const CHUNKS_DIR = path.resolve(BASE_STORAGE_DIR, 'uploads/chunks');
+const SAMPLES_DIR = path.resolve(BASE_STORAGE_DIR, 'samples');
 
 for (const dir of [UPLOADS_DIR, PROCESSED_DIR, CHUNKS_DIR, SAMPLES_DIR]) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+  try {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  } catch (err) {
+    console.warn('Directory init note:', dir, err);
   }
 }
+
+// FFmpeg binary resolution: use ffmpeg-static if present, else fallback to system ffmpeg
+const FFMPEG_BIN = (ffmpegStatic && fs.existsSync(ffmpegStatic)) ? `"${ffmpegStatic}"` : 'ffmpeg';
 
 // Multer storage
 const storage = multer.diskStorage({
@@ -131,30 +144,66 @@ export function generateVttContent(subtitles: SubtitleCue[]): string {
   return `WEBVTT - SUBLYAI Hindi to English Subtitles\n\n${cues}`;
 }
 
-// Extract duration with ffprobe
+// Helper to persist jobs in memory and on disk for serverless compatibility
+function getJob(id: string): TranslationJob | null {
+  if (jobs.has(id)) return jobs.get(id)!;
+  try {
+    const jobFile = path.join(PROCESSED_DIR, id, 'job.json');
+    if (fs.existsSync(jobFile)) {
+      const data = JSON.parse(fs.readFileSync(jobFile, 'utf-8'));
+      jobs.set(id, data);
+      return data;
+    }
+  } catch {}
+  return null;
+}
+
+function saveJob(job: TranslationJob) {
+  jobs.set(job.id, job);
+  try {
+    const jobDir = path.join(PROCESSED_DIR, job.id);
+    if (!fs.existsSync(jobDir)) {
+      fs.mkdirSync(jobDir, { recursive: true });
+    }
+    fs.writeFileSync(path.join(jobDir, 'job.json'), JSON.stringify(job), 'utf-8');
+  } catch {}
+}
+
+// Extract duration with ffprobe or ffmpeg banner fallback
 async function getVideoDuration(filePath: string): Promise<number> {
   try {
     const { stdout } = await execAsync(
       `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`
     );
     const dur = parseFloat(stdout.trim());
-    return isNaN(dur) ? 0 : dur;
-  } catch (err) {
-    console.warn('ffprobe failed, falling back to 0 duration', err);
-    return 0;
-  }
+    if (!isNaN(dur) && dur > 0) return dur;
+  } catch {}
+
+  // Fallback: parse Duration: HH:MM:SS from ffmpeg banner
+  try {
+    const { stderr } = await execAsync(`${FFMPEG_BIN} -i "${filePath}" 2>&1 || true`);
+    const match = stderr.match(/Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})/);
+    if (match) {
+      const hours = parseFloat(match[1]);
+      const mins = parseFloat(match[2]);
+      const secs = parseFloat(match[3]);
+      return hours * 3600 + mins * 60 + secs;
+    }
+  } catch {}
+
+  return 0;
 }
 
 // Extract audio using FFmpeg with multithreading and ultrafast speed
 async function extractAudio(videoPath: string, outputAudioPath: string): Promise<void> {
-  const cmd = `ffmpeg -y -threads 0 -i "${videoPath}" -vn -acodec libmp3lame -ar 16000 -ac 1 -b:a 48k "${outputAudioPath}"`;
+  const cmd = `${FFMPEG_BIN} -y -threads 0 -i "${videoPath}" -vn -acodec libmp3lame -ar 16000 -ac 1 -b:a 48k "${outputAudioPath}"`;
   await execAsync(cmd);
 }
 
 // Divide audio into segments for long videos
 async function segmentAudio(audioPath: string, jobDir: string, segmentSeconds = 60): Promise<string[]> {
   const segPattern = path.join(jobDir, 'seg_%03d.mp3');
-  const cmd = `ffmpeg -y -i "${audioPath}" -f segment -segment_time ${segmentSeconds} -c copy "${segPattern}"`;
+  const cmd = `${FFMPEG_BIN} -y -i "${audioPath}" -f segment -segment_time ${segmentSeconds} -c copy "${segPattern}"`;
   await execAsync(cmd);
 
   const files = fs.readdirSync(jobDir)
@@ -667,7 +716,7 @@ app.post('/api/jobs/:id/burn', async (req, res) => {
     const escapedSrt = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
     
     // Render subtitles with high-contrast styling: bold, white text with black outline and soft shadow
-    const cmd = `ffmpeg -y -threads 0 -i "${inputVideoPath}" -vf "subtitles='${escapedSrt}':force_style='FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=1,MarginV=35'" -c:v libx264 -preset ultrafast -crf 23 -c:a copy "${outputVideoPath}"`;
+    const cmd = `${FFMPEG_BIN} -y -threads 0 -i "${inputVideoPath}" -vf "subtitles='${escapedSrt}':force_style='FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=1,MarginV=35'" -c:v libx264 -preset ultrafast -crf 23 -c:a copy "${outputVideoPath}"`;
 
     await execAsync(cmd);
 
@@ -868,7 +917,7 @@ async function ensureSampleFiles() {
         const titleText = s.title.replace(/'/g, "\\'");
         
         // Use FFmpeg to generate clean video with title text & timestamp burned in
-        const cmd = `ffmpeg -y -f lavfi -i "color=c=${color}:s=1280x720:d=${dur}" -f lavfi -i "sine=frequency=320:duration=${dur}" -vf "drawtext=text='${titleText}':fontcolor=white:fontsize=36:x=(w-text_w)/2:y=(h-text_h)/2-40,drawtext=text='SUBLYAI Hindi Dialogue Sample Stream':fontcolor=0x9333ea:fontsize=22:x=(w-text_w)/2:y=(h-text_h)/2+30" -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "${targetPath}"`;
+        const cmd = `${FFMPEG_BIN} -y -f lavfi -i "color=c=${color}:s=1280x720:d=${dur}" -f lavfi -i "sine=frequency=320:duration=${dur}" -vf "drawtext=text='${titleText}':fontcolor=white:fontsize=36:x=(w-text_w)/2:y=(h-text_h)/2-40,drawtext=text='SUBLYAI Hindi Dialogue Sample Stream':fontcolor=0x9333ea:fontsize=22:x=(w-text_w)/2:y=(h-text_h)/2+30" -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "${targetPath}"`;
         await execAsync(cmd);
       } catch (err) {
         console.warn('Failed to pre-generate sample video', s.id, err);
@@ -898,9 +947,11 @@ app.post('/api/samples/:sampleId/load', (req, res) => {
   // Copy sample to uploads directory if not already there
   const sampleSource = path.join(SAMPLES_DIR, videoFileName);
   const uploadDest = path.join(UPLOADS_DIR, videoFileName);
-  if (fs.existsSync(sampleSource) && !fs.existsSync(uploadDest)) {
-    fs.copyFileSync(sampleSource, uploadDest);
-  }
+  try {
+    if (fs.existsSync(sampleSource) && !fs.existsSync(uploadDest)) {
+      fs.copyFileSync(sampleSource, uploadDest);
+    }
+  } catch {}
 
   const job: TranslationJob = {
     id: jobId,
@@ -919,16 +970,18 @@ app.post('/api/samples/:sampleId/load', (req, res) => {
 
   // Generate on-disk SRT and VTT for sample
   const jobWorkDir = path.join(PROCESSED_DIR, jobId);
-  if (!fs.existsSync(jobWorkDir)) {
-    fs.mkdirSync(jobWorkDir, { recursive: true });
-  }
-  fs.writeFileSync(path.join(jobWorkDir, 'subtitles.srt'), generateSrtContent(job.subtitles), 'utf-8');
-  fs.writeFileSync(path.join(jobWorkDir, 'subtitles.vtt'), generateVttContent(job.subtitles), 'utf-8');
+  try {
+    if (!fs.existsSync(jobWorkDir)) {
+      fs.mkdirSync(jobWorkDir, { recursive: true });
+    }
+    fs.writeFileSync(path.join(jobWorkDir, 'subtitles.srt'), generateSrtContent(job.subtitles), 'utf-8');
+    fs.writeFileSync(path.join(jobWorkDir, 'subtitles.vtt'), generateVttContent(job.subtitles), 'utf-8');
+  } catch {}
 
   job.srtUrl = `/api/jobs/${jobId}/download/srt`;
   job.vttUrl = `/api/jobs/${jobId}/download/vtt`;
 
-  jobs.set(jobId, job);
+  saveJob(job);
   res.json({ success: true, job });
 });
 
@@ -955,7 +1008,13 @@ async function startServer() {
   });
 }
 
-startServer().catch(err => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+// In standard Node environments, start server; on Vercel serverless, export app
+if (!process.env.VERCEL && !process.env.AWS_LAMBDA_FUNCTION_NAME) {
+  startServer().catch(err => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}
+
+export { app };
+export default app;

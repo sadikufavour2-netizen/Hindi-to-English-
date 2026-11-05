@@ -100,25 +100,34 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({ onJobCreated, onOp
     return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
   };
 
-  // Resilient Chunked Upload supporting any file size, completely immune to proxy body limits
+  // Resilient Chunked Upload supporting any file size, completely immune to Vercel 4.5MB and Cloud Run limits
   const uploadViaChunks = async (file: File, signal: AbortSignal): Promise<TranslationJob> => {
-    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB per chunk (safely under Cloud Run 32MB payload limit)
+    // 2.5MB per chunk ensures payload is always safely under Vercel's strict 4.5MB serverless limit
+    const CHUNK_SIZE = Math.floor(2.5 * 1024 * 1024);
     const totalSize = file.size;
     const totalChunks = Math.ceil(totalSize / CHUNK_SIZE);
 
-    setUploadStatusText(`Initializing session (${totalChunks} chunks)...`);
+    setUploadStatusText(`Initializing upload session (${totalChunks} chunks)...`);
 
     // 1. Initialize upload session
-    const initRes = await fetch('/api/upload/init', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fileName: file.name, totalSize }),
-      signal
-    });
+    let initRes: Response;
+    try {
+      initRes = await fetch('/api/upload/init', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileName: file.name, totalSize }),
+        signal
+      });
+    } catch (netErr: any) {
+      throw new Error(`Cannot connect to upload server: ${netErr.message || 'Network error'}. Check that your deployment backend is running.`);
+    }
 
     if (!initRes.ok) {
       const err = await initRes.json().catch(() => ({}));
-      throw new Error(err.error || 'Failed to initialize upload session');
+      if (initRes.status === 404) {
+        throw new Error('Upload API not found (HTTP 404). On Vercel, verify that vercel.json rewrites are deployed and GEMINI_API_KEY is configured in Settings > Environment Variables.');
+      }
+      throw new Error(err.error || `Failed to initialize upload session (HTTP ${initRes.status})`);
     }
 
     const { uploadId } = await initRes.json();
@@ -260,8 +269,8 @@ export const VideoUploader: React.FC<VideoUploaderProps> = ({ onJobCreated, onOp
     try {
       let createdJob: TranslationJob;
 
-      // If file is > 15MB, use chunked upload directly to stay safely within Cloud Run proxy limits
-      if (selectedFile.size > 15 * 1024 * 1024) {
+      // If file is > 3.5MB, use chunked upload directly to stay safely within Vercel's 4.5MB serverless limit
+      if (selectedFile.size > 3.5 * 1024 * 1024) {
         createdJob = await uploadViaChunks(selectedFile, abortController.signal);
       } else {
         try {
