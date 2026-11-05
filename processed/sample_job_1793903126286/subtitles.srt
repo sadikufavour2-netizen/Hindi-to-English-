@@ -1,0 +1,19 @@
+1
+00:00:00,800 --> 00:00:04,500
+[Aman]: Namaste sir! Today we are here to eliminate the biggest bottlenecks in India's logistics sector.
+
+2
+00:00:05,200 --> 00:00:09,800
+[Neha]: Delivery partners in Tier-2 and Tier-3 cities don't get real-time optimized routing.
+
+3
+00:00:10,400 --> 00:00:15,600
+[Aman]: Our AI engine cuts fuel consumption by up to twenty-five percent.
+
+4
+00:00:16,200 --> 00:00:21,000
+[Investor]: The concept has real merit, but tell me: what is your customer acquisition cost?
+
+5
+00:00:21,800 --> 00:00:26,500
+[Neha]: Sir, thanks to organic word-of-mouth referrals, our CAC is half of our competitors.

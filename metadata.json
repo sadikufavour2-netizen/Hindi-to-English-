@@ -1,0 +1,6 @@
+{
+  "name": "SUBLYAI - Hindi to English AI Video Translation",
+  "description": "Watch any Hindi video in English. Upload Hindi movies, TV series, episodes, and videos to automatically transcribe, translate, and synchronize natural English subtitles.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
